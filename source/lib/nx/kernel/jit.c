@@ -46,7 +46,7 @@ Result jitCreate(Jit* j, void* rx_addr, size_t size)
     {
     case JitType_SetProcessMemoryPermission:
         virtmemLock();
-        j->rx_addr = virtmemFindCodeMemory(j->size, 0x1000);
+        j->rx_addr = rx_addr == NULL ? virtmemFindCodeMemory(j->size, 0x1000) : rx_addr;
         j->rw_addr = j->src_addr;
         j->rv      = virtmemAddReservation(j->rx_addr, j->size);
         virtmemUnlock();
@@ -68,7 +68,7 @@ Result jitCreate(Jit* j, void* rx_addr, size_t size)
             if (R_SUCCEEDED(rc))
             {
                 virtmemLock();
-                j->rx_addr = virtmemFindCodeMemory(j->size, 0x1000);
+                j->rx_addr = rx_addr == NULL ? virtmemFindCodeMemory(j->size, 0x1000) : rx_addr;
                 rc = svcControlCodeMemory(j->handle, CodeMapOperation_MapSlave, j->rx_addr, j->size, Perm_Rx);
                 virtmemUnlock();
 
