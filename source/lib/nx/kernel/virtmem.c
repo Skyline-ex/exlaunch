@@ -38,9 +38,8 @@ static bool g_IsLegacyKernel;
 uintptr_t __virtmem_rng(void)
 {
     /* lol. */
-    static COUNT = 0;
-    uintptr_t result = svcGetSystemTick() + COUNT;
-    COUNT *= 2;
+    static u64 COUNT = 0;
+    uintptr_t result = svcGetSystemTick() * ++COUNT;
     return result;
 }
 

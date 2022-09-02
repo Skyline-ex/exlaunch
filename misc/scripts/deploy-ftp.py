@@ -35,6 +35,7 @@ with FTP() as ftp:
     for i in range(len(pl_sd_out.parents)-2, -1, -1):
         d = pl_sd_out.parents[i]
         ftp.mkd(str(d))
+            
     ftp.mkd(str(pl_sd_out))
     
     # Move to created directory

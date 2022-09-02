@@ -35,6 +35,34 @@
 
 namespace exl::hook::nx64 {
 
+    struct HookData;
+    struct HookCtx {
+        uintptr_t handler;
+        HookData* data;
+    };
+
+    static_assert(sizeof(HookCtx) == 0x10);
+    static_assert(offsetof(HookCtx, handler) == 0x00);
+    static_assert(offsetof(HookCtx,    data) == 0x08);
+
+    struct HookData {
+        uintptr_t trampoline;
+        uintptr_t callback;
+        bool is_enabled;
+    };
+
+    static_assert(sizeof(HookData) == 0x18);
+    static_assert(offsetof(HookData, trampoline) == 0x00);
+    static_assert(offsetof(HookData,   callback) == 0x08);
+    static_assert(offsetof(HookData, is_enabled) == 0x10);
+
+    enum HookHandlerType : unsigned char {
+        Hook = 0,
+        Inline = 1,
+        InlineEx = 2,
+        Detour = 3
+    };
+
     template<typename T>
     concept RealFunction = std::is_function_v<T> || std::is_function_v<std::remove_pointer_t<T>> || std::is_function_v<std::remove_reference_t<T>>;
 
@@ -109,6 +137,8 @@ namespace exl::hook::nx64 {
     Func1 HookFunc(Func1 hook, Func2 callback, bool do_trampoline = false) {
         return HookFunc(reinterpret_cast<Func1>(hook), reinterpret_cast<Func1>(callback), do_trampoline);
     }
+
+    extern "C" const void* install_hook(const void* symbol, const void* replace, HookHandlerType ty);
 
     //void InlineHook(uintptr_t addr, InlineCallback* callback);
 };

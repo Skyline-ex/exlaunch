@@ -32,6 +32,8 @@
 
 #include "nx_hook.hpp"
 #include "util/sys/rw_pages.hpp"
+#include "util/sys/mem_layout.hpp"
+#include "pointer_map.hpp"
 
 
 #define __attribute __attribute__
@@ -53,26 +55,103 @@ namespace exl::hook::nx64 {
     namespace {
 
         // Hooking constants
+        /**
+         * @brief The maximum number of instructions which can be overwritten while hooking
+         * 
+         */
         constexpr s64 MaxInstructions = 5;
-        constexpr u64 HookMax = 10;
+
+        /**
+         * @brief The maximum numer of hooks allowed to be installed
+         * 
+         */
+        constexpr u64 HookMax = 0x1000;
+
+        /**
+         * @brief The size of code memory to be set aside for the trampoline when hooking
+         * 
+         */
         constexpr size_t TrampolineSize = MaxInstructions * 10;
+
+        /**
+         * @brief 
+         * 
+         */
         constexpr u64 MaxReferences = MaxInstructions * 2;
+
+        /**
+         * @brief The encoded instruction for `nop`
+         * 
+         */
         constexpr u32 Aarch64Nop = 0xd503201f;
+
+        /**
+         * @brief The pool of Aarch64 instructions that supports the max number of hooks and the
+         *  amount of instructions to set aside for the trampoline
+         * 
+         */
         typedef uint32_t HookPool[HookMax][TrampolineSize];
+
+        /**
+         * @brief The aligned size of the hook pool
+         * 
+         */
         constexpr size_t HookPoolSize = ALIGN_UP(sizeof(HookPool), PAGE_SIZE);
 
-        // Inline hooking constants
-        extern const u64 InlineHandlerStart;
-        extern const u64 InlineHandlerEnd;
-        constexpr size_t InlineHookHandlerSize = 0x9C; // correct if handler size changes
-        struct PACKED InlineHookEntry {
-            char m_Handler[InlineHookHandlerSize];
-            void* m_Callback;
-            void* m_Trampoline;
+        /**
+         * @brief The size of the handler (in bytes)
+         * 
+         */
+        constexpr size_t HookHandlerSize = 0xC;
+
+        extern "C" {
+            /**
+             * @brief The handler for the standard inline hook
+             * 
+             */
+            extern const u64 InlineHandlerImpl;
+
+            /**
+             * @brief The handler for the extended inline hook
+             * 
+             */
+            extern const u64 InlineExHandlerImpl;
+
+            /**
+             * @brief The handler for the detour
+             * 
+             */
+            extern const u64 DetourHandlerImpl;
+
+            /**
+             * @brief The handler for the standard hook
+             * 
+             */
+            extern const u64 HookHandlerImpl;
+
+            extern const u8 HookHandler[HookHandlerSize];
+        }
+
+        struct PACKED Handler {
+            std::array<char, HookHandlerSize> handler;
+            HookCtx context;
         };
-        constexpr size_t InlineHookSize = sizeof(InlineHookEntry);
-        constexpr size_t InlineHookMax = 1;
-        constexpr size_t InlineHookPoolSize = InlineHookSize * InlineHookMax;
+
+        static_assert(sizeof(Handler) == HookHandlerSize + 0x10);
+        static_assert(offsetof(Handler, handler) == 0x00);
+        static_assert(offsetof(Handler, context) == HookHandlerSize);
+        
+        /**
+         * @brief The maximum number of handlers. 2x the maximum number of hooks since hooks need an extra handler.
+         * 
+         */
+        constexpr size_t MaxHandlers = HookMax * 2;
+
+        /**
+         * @brief The size of the handler pool
+         * 
+         */
+        constexpr size_t HandlerPoolSize = sizeof(HookHandler) * MaxHandlers;
 
         typedef uint32_t* __restrict* __restrict instruction;
         typedef struct {
@@ -521,18 +600,79 @@ namespace exl::hook::nx64 {
 
 //-------------------------------------------------------------------------
 
-static Jit s_HookJit;
+static Jit s_ImplJit;
+static Jit s_HandlerJit;
+static PointerMap<HookData> s_UserToData;
+static PointerMap<HookData*> s_BaseToLast;
+static HookData s_HookDatas[HookMax];
 //static nn::os::MutexType hookMutex;
 
 //-------------------------------------------------------------------------
 
+/**
+ * @brief Find's suitable memory with the given size immediately before the start
+ *  of `main`
+ * 
+ * @param size The size of the memory to find
+ * @return void* - The Memory
+ */
+void* FindSuitableMemory(size_t size) {
+    // Precalculate our target size
+    const size_t TARGET_SIZE = ALIGN_UP(size, PAGE_SIZE);
+
+    // Get the ASLR start address so that in our attempt to go beneath main we don't go into unaddressable memory
+    u64 out[2];
+    svcGetInfo(out, InfoType::InfoType_AslrRegionAddress, envGetOwnProcessHandle(), 0);
+    const uintptr_t ASLR_START = static_cast<uintptr_t>(out[0]);
+    auto current = util::GetRtldModuleInfo().m_Text.m_Start;
+
+    void* located = nullptr;
+
+    MemoryInfo info;
+    while (current >= ASLR_START) {
+        u32 page_info;
+        R_ABORT_UNLESS(svcQueryMemory(&info, &page_info, reinterpret_cast<u64>(current)));
+
+        if (info.type == MemoryType::MemType_Unmapped && info.size >= TARGET_SIZE) {
+            located = reinterpret_cast<void*>(ALIGN_DOWN(info.addr + info.size - size, PAGE_SIZE));
+            break;
+        }
+
+        current = reinterpret_cast<uintptr_t>(info.addr - TARGET_SIZE);
+    }
+
+    if (located == nullptr) {
+        current = util::GetSdkModuleInfo().m_Text.m_Start;
+
+        while (true) {
+            u32 page_info;
+            R_ABORT_UNLESS(svcQueryMemory(&info, &page_info, reinterpret_cast<u64>(current)));
+
+            if (info.type == MemoryType::MemType_Unmapped && info.size >= TARGET_SIZE) {
+                located = reinterpret_cast<void*>(ALIGN_DOWN(info.addr + info.size - size, PAGE_SIZE));
+                break;
+            }
+
+            current = reinterpret_cast<uintptr_t>(info.addr + info.size);
+        }
+    }
+
+    EXL_ASSERT(located != nullptr, "Failed to locate serviceable JIT memory");
+
+    return located;
+}
+
 void Initialize() {
     /* TODO: thread safety */
+    void* handler_mem = FindSuitableMemory(HandlerPoolSize);
+    R_ABORT_UNLESS(jitCreate(&s_HandlerJit, handler_mem, HandlerPoolSize));
 
-    alignas(PAGE_SIZE) static u8 hookJitRw[HookPoolSize] = {};
+    R_ABORT_UNLESS(jitTransitionToExecutable(&s_HandlerJit));
 
-    R_ABORT_UNLESS(jitCreate(&s_HookJit, &hookJitRw, HookPoolSize));
-    R_ABORT_UNLESS(jitTransitionToExecutable(&s_HookJit));
+    void* impl_mem = FindSuitableMemory(HookPoolSize);
+    R_ABORT_UNLESS(jitCreate(&s_ImplJit, impl_mem, HookPoolSize));
+
+    R_ABORT_UNLESS(jitTransitionToExecutable(&s_ImplJit));
 
     /* TODO: inline hooks */
     /*static u8 _inlhk_rw[InlineHookPoolSize];
@@ -551,8 +691,8 @@ Result AllocForTrampoline(uint32_t** rx, uint32_t** rw) {
     if(i > HookMax)
         return result::HookTrampolineAllocFail;
 
-    HookPool* rwptr = (HookPool*)s_HookJit.rw_addr;
-    HookPool* rxptr = (HookPool*)s_HookJit.rx_addr;
+    HookPool* rwptr = (HookPool*)s_ImplJit.rw_addr;
+    HookPool* rxptr = (HookPool*)s_ImplJit.rx_addr;
     *rw = (*rwptr)[i];
     *rx = (*rxptr)[i];
 
@@ -616,7 +756,7 @@ uintptr_t HookFuncCommon(uintptr_t hook, uintptr_t callback, bool do_trampoline)
     EXL_ASSERT(callback != 0);
 
     /* TODO: thread safety */
-    R_ABORT_UNLESS(jitTransitionToWritable(&s_HookJit));
+    R_ABORT_UNLESS(jitTransitionToWritable(&s_ImplJit));
 
     u32* rxtrampoline = NULL;
     u32* rwtrampoline = NULL;
@@ -626,9 +766,88 @@ uintptr_t HookFuncCommon(uintptr_t hook, uintptr_t callback, bool do_trampoline)
     if (!HookFuncImpl(reinterpret_cast<void*>(hook), reinterpret_cast<void*>(callback), rxtrampoline, rwtrampoline))
         EXL_ABORT(exl::result::HookFailed);
 
-    R_ABORT_UNLESS(jitTransitionToExecutable(&s_HookJit));
+    R_ABORT_UNLESS(jitTransitionToExecutable(&s_ImplJit));
 
     return (uintptr_t) rxtrampoline;
+}
+
+extern "C" const void* install_hook(const void* symbol, const void* replace, HookHandlerType ty) {
+    static volatile s32 index = -1;
+    static volatile s32 hook_data_index = -1;
+    const char* handler = nullptr;
+    switch (ty) {
+        case HookHandlerType::Hook:
+            handler = reinterpret_cast<const char*>(&HookHandlerImpl);
+            break;
+        case HookHandlerType::Inline:
+            handler = reinterpret_cast<const char*>(&InlineHandlerImpl);
+            break;
+        case HookHandlerType::InlineEx:
+            handler = reinterpret_cast<const char*>(&InlineExHandlerImpl);
+            break;
+        case HookHandlerType::Detour:
+            handler = reinterpret_cast<const char*>(&DetourHandlerImpl);
+            break;
+    }
+
+    const bool generate_impl = ty == HookHandlerType::Hook;
+
+    auto current = static_cast<size_t>(__atomic_increase(&index));
+
+    if (current > MaxHandlers)
+        EXL_ABORT(result::HookFailed);
+
+    R_ABORT_UNLESS(jitTransitionToExecutable(&s_HandlerJit));
+
+    auto& rx_entries = *reinterpret_cast<std::array<Handler, MaxHandlers>*>(s_HandlerJit.rx_addr);
+    auto& rx = rx_entries[current];
+
+    jitTransitionToWritable(&s_HandlerJit);
+
+    auto& rw_entries = *reinterpret_cast<std::array<Handler, MaxHandlers>*>(s_HandlerJit.rw_addr);
+    auto& rw = rw_entries[current];
+
+    uintptr_t trampoline = HookFuncCommon(reinterpret_cast<uintptr_t>(symbol), reinterpret_cast<uintptr_t>(rx.handler.data()), true);
+
+    std::memcpy(rw.handler.data(), reinterpret_cast<const void*>(HookHandler), HookHandlerSize);
+
+    if (generate_impl) {
+        auto hook_data_idx = static_cast<size_t>(__atomic_increase(&hook_data_index));
+        if (hook_data_idx > HookMax)
+            EXL_ABORT(result::HookFailed);
+
+        auto hook_idx = static_cast<size_t>(__atomic_increase(&index));
+        if (hook_idx > MaxHandlers)
+            EXL_ABORT(result::HookFailed);
+
+        auto& rx = rx_entries[hook_idx];
+        auto& rw = rw_entries[hook_idx];
+
+        s_HookDatas[hook_data_idx] = HookData {
+            .trampoline = reinterpret_cast<uintptr_t>(nullptr),
+            .callback = trampoline,
+            .is_enabled = true
+        };
+
+        std::memcpy(rw.handler.data(), reinterpret_cast<const void*>(HookHandler), HookHandlerSize);
+        rw.context.handler = reinterpret_cast<uintptr_t>(handler);
+        rw.context.data = &s_HookDatas[hook_data_idx];
+
+        trampoline = reinterpret_cast<uintptr_t>(&rx);
+    }
+
+
+    if (!s_UserToData.Insert(reinterpret_cast<uintptr_t>(replace), HookData { .trampoline = trampoline, .callback = reinterpret_cast<uintptr_t>(replace), .is_enabled = true })) {
+        EXL_ABORT(result::HookFailed);
+    }
+
+    auto* hook_data = s_UserToData.GetMut(reinterpret_cast<uintptr_t>(replace));
+    rw.context.handler = reinterpret_cast<uintptr_t>(handler);
+    rw.context.data = hook_data;
+
+    jitTransitionToExecutable(&s_HandlerJit);
+
+    return generate_impl ? reinterpret_cast<const void*>(trampoline) : nullptr;
 }
 
 //-------------------------------------------------------------------------
