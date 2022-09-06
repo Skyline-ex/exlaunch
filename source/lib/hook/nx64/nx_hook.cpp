@@ -102,7 +102,7 @@ namespace exl::hook::nx64 {
          * @brief The size of the handler (in bytes)
          * 
          */
-        constexpr size_t HookHandlerSize = 0xC;
+        constexpr size_t HookHandlerSize = 0x10;
 
         extern "C" {
             /**
@@ -137,7 +137,7 @@ namespace exl::hook::nx64 {
             HookCtx context;
         };
 
-        static_assert(sizeof(Handler) == HookHandlerSize + 0x10);
+        static_assert(sizeof(Handler) == HookHandlerSize + 0x8);
         static_assert(offsetof(Handler, handler) == 0x00);
         static_assert(offsetof(Handler, context) == HookHandlerSize);
         
@@ -603,7 +603,7 @@ namespace exl::hook::nx64 {
 static Jit s_ImplJit;
 static Jit s_HandlerJit;
 static PointerMap<HookData> s_UserToData;
-static PointerMap<HookData*> s_BaseToLast;
+static PointerMap<size_t> s_OrigToEntry;
 static HookData s_HookDatas[HookMax];
 //static nn::os::MutexType hookMutex;
 
@@ -771,10 +771,147 @@ uintptr_t HookFuncCommon(uintptr_t hook, uintptr_t callback, bool do_trampoline)
     return (uintptr_t) rxtrampoline;
 }
 
+bool IsHigherPriority(uintptr_t existing, uintptr_t new_) {
+    if ((existing >= reinterpret_cast<uintptr_t>(&DetourHandlerImpl)) && (existing <= reinterpret_cast<uintptr_t>(&HookHandlerImpl))) {
+        return new_ < existing;
+    } else {
+        return true;
+    }
+}
+
+bool IsInJitRange(const Jit* jit, uintptr_t addr) {
+    uintptr_t start = reinterpret_cast<uintptr_t>(jit->rx_addr);
+    uintptr_t end = start + jit->size;
+    return (start <= addr) && (addr <= end);
+}
+
+const void* chain_hook(
+    size_t* entry,
+    const void* symbol,
+    const void* replace,
+    HookHandlerType ty,
+    volatile s32* index,
+    volatile s32* hook_index
+) {
+    R_ABORT_UNLESS(jitTransitionToExecutable(&s_HandlerJit));
+    auto& rx_entries = *reinterpret_cast<std::array<Handler, MaxHandlers>*>(s_HandlerJit.rx_addr);
+    auto* rx = &rx_entries[*entry];
+    const char* handler = nullptr;
+    switch (ty) {
+        case HookHandlerType::Hook:
+            handler = reinterpret_cast<const char*>(&HookHandlerImpl);
+            break;
+        case HookHandlerType::Inline:
+            handler = reinterpret_cast<const char*>(&InlineHandlerImpl);
+            break;
+        case HookHandlerType::InlineEx:
+            handler = reinterpret_cast<const char*>(&InlineExHandlerImpl);
+            break;
+        case HookHandlerType::Detour:
+            handler = reinterpret_cast<const char*>(&DetourHandlerImpl);
+            break;
+    }
+
+    auto* hook_handler = rx;
+    auto* data = hook_handler->context.data;
+    bool is_higher_priority = false;
+    while (true) {
+        if (IsHigherPriority(data->handler, reinterpret_cast<uintptr_t>(handler))) {
+            is_higher_priority = true;
+            break;   
+        }
+        if (!IsInJitRange(&s_HandlerJit, data->trampoline)) {
+            is_higher_priority = data->trampoline == 0;
+            break;
+        }
+        hook_handler = reinterpret_cast<Handler*>(data->trampoline);
+        data = hook_handler->context.data;
+    }
+
+    size_t offset = static_cast<size_t>(hook_handler - rx_entries.data());
+
+    R_ABORT_UNLESS(jitTransitionToWritable(&s_HandlerJit));
+    auto& rw_entries = *reinterpret_cast<std::array<Handler, MaxHandlers>*>(s_HandlerJit.rw_addr);
+    auto& rw_prev = rw_entries[offset];
+
+    size_t current = static_cast<size_t>(__atomic_increase(index));
+    EXL_ASSERT(current < MaxHandlers, "The current handler index has exceeded the maximum allowed handlers");
+
+    auto& new_rw = rw_entries[current];
+
+    std::memcpy(new_rw.handler.data(), reinterpret_cast<const void*>(HookHandler), HookHandlerSize);
+    
+    auto& new_rx = rx_entries[current];
+
+    HookData new_data = HookData {
+        .trampoline = reinterpret_cast<uintptr_t>(new_rx.handler.data()),
+        .callback = reinterpret_cast<uintptr_t>(replace),
+        .handler = reinterpret_cast<uintptr_t>(handler),
+        .is_enabled = true
+    };
+
+    if (ty == HookHandlerType::Hook && !is_higher_priority) {
+        auto hook_data_idx = static_cast<size_t>(__atomic_increase(hook_index));
+        if (hook_data_idx > HookMax)
+            EXL_ABORT(result::HookFailed);
+
+        auto hook_idx = static_cast<size_t>(__atomic_increase(index));
+        if (hook_idx > MaxHandlers)
+            EXL_ABORT(result::HookFailed);
+
+        auto& rx = rx_entries[hook_idx];
+        auto& rw = rw_entries[hook_idx];
+
+        s_HookDatas[hook_data_idx] = HookData {
+            .trampoline = reinterpret_cast<uintptr_t>(nullptr),
+            .callback = data->trampoline,
+            .handler = reinterpret_cast<uintptr_t>(handler),
+            .is_enabled = true
+        };
+
+        new_data.trampoline = reinterpret_cast<uintptr_t>(rx.handler.data());
+
+        std::memcpy(rw.handler.data(), reinterpret_cast<const void*>(HookHandler), HookHandlerSize);
+        rw.context.data = &s_HookDatas[hook_data_idx];
+
+        data->trampoline = reinterpret_cast<uintptr_t>(new_rx.handler.data());
+        EXL_ASSERT(s_UserToData.Insert(reinterpret_cast<uintptr_t>(replace), new_data), "Failed to insert user hook into map");
+        new_rw.context.data = s_UserToData.GetMut(reinterpret_cast<uintptr_t>(replace));
+        R_ABORT_UNLESS(jitTransitionToExecutable(&s_HandlerJit));
+        return reinterpret_cast<const void*>(rx.handler.data());
+    }
+
+    EXL_ASSERT(s_UserToData.Insert(reinterpret_cast<uintptr_t>(replace), new_data), "Failed to insert user hook into map");
+
+    auto* p_new_data = s_UserToData.GetMut(reinterpret_cast<uintptr_t>(replace));
+
+    if (is_higher_priority) {
+        new_rw.context.data = data;
+        rw_prev.context.data = p_new_data;
+    } else {
+        auto tmp = p_new_data->trampoline;
+        p_new_data->trampoline = data->trampoline;
+        data->trampoline = tmp;
+        new_rw.context.data = p_new_data;
+    }
+
+    R_ABORT_UNLESS(jitTransitionToExecutable(&s_HandlerJit));
+    // if ((offset == *entry) && is_higher_priority) {
+    //     *entry = current;
+    // }
+    return reinterpret_cast<const void*>(new_rx.handler.data());
+}
+
 extern "C" const void* install_hook(const void* symbol, const void* replace, HookHandlerType ty) {
     static volatile s32 index = -1;
     static volatile s32 hook_data_index = -1;
     const char* handler = nullptr;
+
+    auto* start = s_OrigToEntry.GetMut(reinterpret_cast<uintptr_t>(symbol));
+    if (start != nullptr) {
+        return chain_hook(start, symbol, replace, ty, &index, &hook_data_index);
+    }
+
     switch (ty) {
         case HookHandlerType::Hook:
             handler = reinterpret_cast<const char*>(&HookHandlerImpl);
@@ -826,72 +963,40 @@ extern "C" const void* install_hook(const void* symbol, const void* replace, Hoo
         s_HookDatas[hook_data_idx] = HookData {
             .trampoline = reinterpret_cast<uintptr_t>(nullptr),
             .callback = trampoline,
+            .handler = reinterpret_cast<uintptr_t>(handler),
             .is_enabled = true
         };
 
         std::memcpy(rw.handler.data(), reinterpret_cast<const void*>(HookHandler), HookHandlerSize);
-        rw.context.handler = reinterpret_cast<uintptr_t>(handler);
         rw.context.data = &s_HookDatas[hook_data_idx];
 
         trampoline = reinterpret_cast<uintptr_t>(&rx);
     }
 
+    HookData data = HookData {
+        .trampoline = trampoline,
+        .callback = reinterpret_cast<uintptr_t>(replace),
+        .handler = reinterpret_cast<uintptr_t>(handler),
+        .is_enabled = true
+    };
 
-    if (!s_UserToData.Insert(reinterpret_cast<uintptr_t>(replace), HookData { .trampoline = trampoline, .callback = reinterpret_cast<uintptr_t>(replace), .is_enabled = true })) {
+    if (!s_UserToData.Insert(reinterpret_cast<uintptr_t>(replace), data)) {
         EXL_ABORT(result::HookFailed);
     }
 
     auto* hook_data = s_UserToData.GetMut(reinterpret_cast<uintptr_t>(replace));
-    rw.context.handler = reinterpret_cast<uintptr_t>(handler);
     rw.context.data = hook_data;
 
     jitTransitionToExecutable(&s_HandlerJit);
 
+    EXL_ASSERT(s_OrigToEntry.Insert(reinterpret_cast<uintptr_t>(symbol), current), "Unable to insert symbol into map");
+
     return generate_impl ? reinterpret_cast<const void*>(trampoline) : nullptr;
 }
 
-//-------------------------------------------------------------------------
-
-/*u64 inline_hook_curridx = 0;
-
-extern "C" void A64InlineHook(void* const symbol, void* const replace) {
-    u64 start = (u64)&InlineHandlerStart;
-    u64 end = (u64)&InlineHandlerEnd;
-
-    // make sure inline hook handler constexpr is correct
-    if(InlineHookHandlerSize != end - start)
-        R_ABORT_UNLESS(-1);
-
-    // prepare to copy handler
-    jitTransitionToWritable(&__inlhk_jit);
-    InlineHookEntry* rw_start = (InlineHookEntry*)__inlhk_jit.rw_addr;
-    InlineHookEntry* rw = rw_start + inline_hook_curridx;
-
-    // copy handler
-    memcpy(rw->handler, (void*)start, InlineHookHandlerSize);
-
-    // prepare to hook
-    jitTransitionToExecutable(&__inlhk_jit);
-    InlineHookEntry* rx_start = (InlineHookEntry*)__inlhk_jit.rx_addr;
-    InlineHookEntry* rx = rx_start + inline_hook_curridx;
-
-    // hook to call the handler
-    void* trampoline;
-    A64HookFunction(symbol, rx->handler, &trampoline);
-
-    // write trampoline/callback to entry
-    jitTransitionToWritable(&__inlhk_jit);
-    rw->callback = replace;
-    rw->m_Trampoline = trampoline;
-
-    // finalize, make handler executable
-    jitTransitionToExecutable(&__inlhk_jit);
-
-    inline_hook_curridx++;
-
-    //if(inline_hook_curridx > InlineHookMax)
-        //skyline::logger::s_Instance->LogFormat("[A64InlineHook] inline hook pool exausted!");
+extern "C" void set_hook_enable(const void* replace, bool enable) {
+    auto* hook_data = s_UserToData.GetMut(reinterpret_cast<uintptr_t>(replace));
+    hook_data->is_enabled = enable;
 }
-*/
 
 };

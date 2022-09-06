@@ -13,12 +13,12 @@
 
 # Structures:
 # HookCtx:
-#   - uintptr_t @ 0x0 - Pointer to handler
-#   - uintptr_t @ 0x8 - Pointer to HookData
+#   - uintptr_t @ 0x0 - Pointer to HookData
 # HookData:
-#   - uintptr_t @ 0x0 - Pointer to trampoline
-#   - uintptr_t @ 0x8 - Pointer to user callback
-#   - bool @ 0x10 - Hook is enabled
+#   - uintptr_t @ 0x00 - Pointer to trampoline
+#   - uintptr_t @ 0x08 - Pointer to user callback
+#   - uintptr_t @ 0x10 - Pointer to the handler for the hook type
+#   - bool @ 0x18 - Hook is enabled
 
 # Backs up the register state of all GP registers
 # to the stack
@@ -147,16 +147,14 @@
 .endm 
 
 # Input:
-#   * x17 - HookCtx*
+#   * x17 - HookData*
 # Output:
 #   * x16 - Trampoline
 #   * x17 - User callback
 .macro prepareHookState
-    # Load the HookData* into x17 register
-    # And then load the struct onto the registers
+    # Load the struct onto the registers
     # x16, x17
-    ldr x17, [x17, 0x8]
-    ldrb w16, [x17, 0x10]
+    ldrb w16, [x17, 0x18]
 
     tbnz w16, #0x0, #0xC
     ldr x16, [x17, 0x0]
@@ -165,6 +163,45 @@
     # RunHook:
     ldp x16, x17, [x17]
 .endm
+
+# Detours are similar to instruction hooks except they are
+# functionally observers.
+#
+# Detours are provided the arguments but their return values are unused,
+# and any modifications made to the register state are unused.
+#
+# In cases where you merely want to observe the data, detours are guaranteed
+# to be run whereas hooks are not.
+CODE_BEGIN DetourHandlerImpl
+    prepareHookState
+
+    armBackupRegistersEx
+
+    # Call the user callback
+    blr x17
+
+    armRecoverRegistersEx
+
+    # Jump to the trampoline
+    br x16
+CODE_END
+
+# Extended inline hooks are the same as
+# regular inline hooks, except they provide read-only
+# access to the stack pointer as well as read/write access
+# to the floating point registers as well
+CODE_BEGIN InlineExHandlerImpl
+    prepareHookState
+
+    armBackupRegistersEx
+
+    mov x0, sp
+    blr x17
+
+    armRecoverRegistersEx
+
+    br x16
+CODE_END
 
 # Inline hooks are functionally callbacks which can
 # mutate the register state when they get run. They
@@ -188,44 +225,6 @@ CODE_BEGIN InlineHandlerImpl
 
 CODE_END
 
-# Extended inline hooks are the same as
-# regular inline hooks, except they provide read-only
-# access to the stack pointer as well as read/write access
-# to the floating point registers as well
-CODE_BEGIN InlineExHandlerImpl
-    prepareHookState
-
-    armBackupRegistersEx
-
-    mov x0, sp
-    blr x17
-
-    armRecoverRegistersEx
-
-    br x16
-CODE_END
-
-# Detours are similar to instruction hooks except they are
-# functionally observers.
-#
-# Detours are provided the arguments but their return values are unused,
-# and any modifications made to the register state are unused.
-#
-# In cases where you merely want to observe the data, detours are guaranteed
-# to be run whereas hooks are not.
-CODE_BEGIN DetourHandlerImpl
-    prepareHookState
-
-    armBackupRegistersEx
-
-    # Call the user callback
-    blr x17
-
-    armRecoverRegistersEx
-
-    # Jump to the trampoline
-    br x16
-CODE_END
 
 # Hooks are the most raw level of redirection, as they have the ability
 # to completely change the implementation. For this reason, hooks are run
@@ -250,7 +249,8 @@ CODE_END
 # the amount of instructions overwritten is very few
 CODE_BEGIN HookHandler
     adr x17, HookHandlerEnd
-    ldr x16, [x17]
+    ldr x17, [x17]
+    ldr x16, [x17, #0x10]
     br x16
 CODE_END
 HookHandlerEnd:

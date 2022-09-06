@@ -37,24 +37,24 @@ namespace exl::hook::nx64 {
 
     struct HookData;
     struct HookCtx {
-        uintptr_t handler;
         HookData* data;
     };
 
-    static_assert(sizeof(HookCtx) == 0x10);
-    static_assert(offsetof(HookCtx, handler) == 0x00);
-    static_assert(offsetof(HookCtx,    data) == 0x08);
+    static_assert(sizeof(HookCtx) == 0x8);
+    static_assert(offsetof(HookCtx,    data) == 0x00);
 
     struct HookData {
         uintptr_t trampoline;
         uintptr_t callback;
+        uintptr_t handler;
         bool is_enabled;
     };
 
-    static_assert(sizeof(HookData) == 0x18);
+    static_assert(sizeof(HookData) == 0x20);
     static_assert(offsetof(HookData, trampoline) == 0x00);
     static_assert(offsetof(HookData,   callback) == 0x08);
-    static_assert(offsetof(HookData, is_enabled) == 0x10);
+    static_assert(offsetof(HookData,    handler) == 0x10);
+    static_assert(offsetof(HookData, is_enabled) == 0x18);
 
     enum HookHandlerType : unsigned char {
         Hook = 0,

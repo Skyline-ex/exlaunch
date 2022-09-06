@@ -13,13 +13,32 @@
 
 // };
 
-void mountRomDetour(char const* name, void* arg2, unsigned long arg3) {
-    // nn::fs::MountSdCardForDebug("sd");
-    // nn::fs::CreateFile("sd:/detour.txt", 0);
-    // nn::fs::FileHandle handle = nn::fs::FileHandle { 0 };
-    // nn::fs::OpenFile(&handle, "sd:/detour.txt", nn::fs::OpenMode_Append | nn::fs::OpenMode_Write);
-    // nn::fs::WriteFile(handle, 0, "detour!", 7, nn::fs::WriteOption::CreateOption(nn::fs::WriteOptionFlag_Flush));
-    // nn::fs::CloseFile(handle);
+static int COUNT = 0;
+void MountRomCallback(char const*, void*, unsigned long) {
+    EXL_ASSERT(COUNT == 0);
+    COUNT++;
+}
+
+void MountRomExInline(exl::hook::nx64::InlineCtx* ctx) {
+    EXL_ASSERT(COUNT == 1);
+    COUNT++;
+}
+
+void MountRomInline(exl::hook::nx64::InlineCtx* ctx) {
+    EXL_ASSERT(COUNT == 2);
+    COUNT++;
+}
+
+static Result (*MountRomOrig)(char const*, void*, unsigned long);
+
+Result MountRomHook(char const* name, void* arg2, unsigned long arg3) {
+    EXL_ASSERT(COUNT == 3);
+    COUNT++;
+    return MountRomOrig(name, arg2, arg3);
+}
+
+void PostMountHook(exl::hook::nx64::InlineCtx* ctx) {
+    EXL_ASSERT(COUNT == 4);
 }
 
 /* Declare function to dynamic link with. */
@@ -28,10 +47,8 @@ extern "C" void exl_main(void* x0, void* x1) {
     /* Setup hooking enviroment. */
     envSetOwnProcessHandle(exl::util::proc_handle::Get());
     exl::hook::Initialize();
-
     /* Install the hook at the provided function pointer. Function type is checked against the callback function. */
     // StubCopyright::InstallAtFuncPtr(nn::oe::SetCopyrightVisibility);
-    exl::hook::nx64::install_hook(reinterpret_cast<const void*>(nn::fs::MountRom), reinterpret_cast<const void*>(mountRomDetour), exl::hook::nx64::HookHandlerType::Detour);
 
     /* Alternative install funcs: */
     /* InstallAtPtr takes an absolute address as a uintptr_t. */
